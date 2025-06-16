@@ -1,77 +1,33 @@
-# =============================================================================
-# Pełny skrypt: temporalny split i wykres „Accuracy vs Step” dla Elliptic
-# =============================================================================
-
 import pandas as pd
 import numpy as np
 from scipy.sparse import coo_matrix
 from sknetwork.gnn import GNNClassifier
 import matplotlib.pyplot as plt
+import random
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score
+from scipy.stats import wilcoxon, kruskal
+import seaborn as sns
 
-# Jeśli nie masz zainstalowanego sknetwork, odkomentuj poniższą linię i uruchom:
-# !pip install scikit-network
-
-# =============================================================================
-# 1. Ścieżki do plików (zmodyfikuj, jeśli Twoje pliki leżą gdzie indziej)
-# =============================================================================
 FEATURES_PATH = 'elliptic_txs_features.csv'
 LABELS_PATH   = 'elliptic_txs_classes.csv'
 EDGES_PATH    = 'elliptic_txs_edgelist.csv'
 
-
-# =============================================================================
-# 2. Wczytanie cech oraz kroków czasowych
-#    ----------------------------------------------------------------------------
-#    • Plik elliptic_txs_features.csv nie ma nagłówka.
-#      - kolumna 0: tx_id (int)
-#      - kolumna 1: step (int od 1 do 49)
-#      - kolumny 2..: wektory cech (float)
-# =============================================================================
 features_df = pd.read_csv(FEATURES_PATH, header=None)
 all_tx_ids   = features_df.iloc[:, 0].astype(int).values
 all_steps    = features_df.iloc[:, 1].astype(int).values
 all_feats    = features_df.iloc[:, 2:].astype(np.float32).values
 N_all        = all_tx_ids.shape[0]
 
-# Mapa pomocnicza: tx_id → indeks oryginalny [0..N_all-1]
 tx_to_idx_all = {tx: idx for idx, tx in enumerate(all_tx_ids)}
-
-print(f"[INFO] Wczytano {N_all} węzłów (cechy + krok). Przykładowe (tx_id, step, cechy[:3]):")
-print(list(zip(all_tx_ids[:5], all_steps[:5], all_feats[:5, :3])), "\n")
-
-# =============================================================================
-# 3. Wczytanie etykiet (labels) i usunięcie wierszy „unknown”
-#    ----------------------------------------------------------------------------
-#    • Plik elliptic_txs_classes.csv ma nagłówek ['txId','class'].
-#      W kolumnie 'class' mogą się pojawić wartości „1”, „2” lub „unknown”.
-# =============================================================================
 labels_df = pd.read_csv(LABELS_PATH, header=0)
-print(f"[DEBUG] labels_df.columns przed czyszczeniem: {list(labels_df.columns)}")
-
-# 3.1. Czystka: usuwamy wiersze, w których 'class' jest NaN lub == "unknown"
 labels_df = labels_df.dropna(subset=['txId', 'class']).copy()
 labels_df = labels_df[labels_df['class'].astype(str).str.lower() != 'unknown'].copy()
-
-# 3.2. Rzutowanie „1”/„2” → int oraz zmiana nazwy kolumny 'txId' → 'tx_id'
 labels_df['txId']  = labels_df['txId'].astype(int)
 labels_df['class'] = labels_df['class'].astype(int)
 labels_df           = labels_df.rename(columns={'txId': 'tx_id'})
-
-# 3.3. Mapowanie etykiet: 1 → 0 (licit), 2 → 1 (illicit)
 label_map = {1: 0, 2: 1}
 labels_df['label_mapped'] = labels_df['class'].map(label_map)
 
-print(f"[INFO] Po usunięciu „unknown” zostało {len(labels_df)} wierszy etykiet.")
-print(f"[DEBUG] labels_df.head():\n{labels_df.head()}\n")
-
-# =============================================================================
-# 4. Łączenie etykiet z krokami czasowymi
-#    ----------------------------------------------------------------------------
-#    • Ponieważ 'step' znajdujemy w features_df (kolumna 1), tworzymy DataFrame:
-#        time_df = pd.DataFrame({'tx_id': all_tx_ids, 'step': all_steps})
-#    • Następnie robimy merge z labels_df, aby uzyskać labels_time_df z kolumnami:
-#        ['tx_id', 'label_mapped', 'step']
-# =============================================================================
 time_df = pd.DataFrame({'tx_id': all_tx_ids, 'step': all_steps})
 labels_time_df = pd.merge(
     labels_df[['tx_id', 'label_mapped']],
@@ -80,22 +36,6 @@ labels_time_df = pd.merge(
     how='inner'
 )
 
-print(f"[INFO] Po scaleniu etykiet i kroków: {len(labels_time_df)} wierszy.")
-print(f"[DEBUG] labels_time_df.head():\n{labels_time_df.head()}\n")
-
-# =============================================================================
-# 5. Filtrowanie węzłów do tych, które mają etykietę 0/1
-#    ----------------------------------------------------------------------------
-#    • Tworzymy zbiór known_tx_ids = {tx_id | ma etykietę 0 lub 1}.
-#    • Filtrowanie z features_df według known_tx_ids:
-#        filtered_tx_ids, filtered_steps, filtered_feats.
-#    • Budujemy:
-#        n_nodes = liczba przefiltrowanych węzłów,
-#        id_to_idx = {tx_id: lokalny indeks [0..n_nodes-1]}.
-#    • Tworzymy wektory:
-#        y_all_filtered[i] = etykieta (0/1),
-#        step_all_filtered[i] = krok (1..49).
-# =============================================================================
 known_tx_ids = set(labels_time_df['tx_id'].values)
 mask_known   = [tx in known_tx_ids for tx in all_tx_ids]
 
@@ -116,35 +56,13 @@ for _, row in labels_time_df.iterrows():
         y_all_filtered[idx]    = lab
         step_all_filtered[idx] = stp
 
-print(f"[INFO] Po filtrowaniu zostaje {n_nodes} węzłów.")
-print(f"[DEBUG] Przykładowe (label, step) pierwszych 10:")
-print(list(zip(y_all_filtered[:10], step_all_filtered[:10])), "\n")
-
-# =============================================================================
-# 6. Budowa pełnej macierzy adjacency_all
-#    ----------------------------------------------------------------------------
-#    • Wczytujemy elliptic_txs_edgelist.csv (nagłówek zwykle ['txId1','txId2']).
-#    • Zmieniamy nazwy na ['txId_1','txId_2'] w razie potrzeby.
-#    • Usuwamy wiersze, gdzie któryś z txId jest NaN.
-#    • Filtrujemy krawędzie, bo bierzemy tylko te, gdzie oba txId ∈ id_to_idx.
-#    • Mapujemy txId → indeks [0..n_nodes-1], tworzymy macierz COO,
-#      dodajemy transpozycję, usuwamy pętle, konwertujemy na CSR.
-# =============================================================================
 edges_df = pd.read_csv(EDGES_PATH, header=0)
-print(f"[DEBUG] edges_df.columns przed rename: {list(edges_df.columns[:5])}")
-
 if 'txId1' in edges_df.columns and 'txId2' in edges_df.columns:
     edges_df = edges_df.rename(columns={'txId1': 'txId_1', 'txId2': 'txId_2'})
-elif 'txId_1' in edges_df.columns and 'txId_2' in edges_df.columns:
-    pass
-else:
-    raise ValueError(f"Nieznane nazwy kolumn w pliku edgelist: {list(edges_df.columns)}")
 
 edges_df = edges_df.dropna(subset=['txId_1', 'txId_2']).copy()
 mask_edges = edges_df['txId_1'].isin(id_to_idx) & edges_df['txId_2'].isin(id_to_idx)
 valid_edges = edges_df[mask_edges].copy()
-
-print(f"[INFO] Wczytano {len(edges_df)} krawędzi, z czego {len(valid_edges)} łączy węzły 0/1.\n")
 
 src = valid_edges['txId_1'].map(id_to_idx).values
 dst = valid_edges['txId_2'].map(id_to_idx).values
@@ -155,33 +73,29 @@ adj_sym.setdiag(0)
 adj_sym.eliminate_zeros()
 adjacency_all = adj_sym.tocsr()
 
-print(f"[INFO] Utworzono pełną macierz adjacency_all o kształcie {adjacency_all.shape}.\n")
-
-# =============================================================================
-# 7. Pętla po kolejnych wartości T₀ (od 1 do max_step-1) i zbieranie Accuracy
-#    ----------------------------------------------------------------------------
 max_step = step_all_filtered.max()
-steps = []
-accuracies = []
+metrics_summary = []
+f1_scores_per_T0 = {}
+
+T0_list = []
+precisions_all, recalls_all, f1s_all, baccs_all = [], [], [], []
 
 for T0 in range(1, max_step):
-    # 7.1. Indeksy węzłów treningowych (step ≤ T0) i inferencyjnych (step == T0+1)
-    train_time_idx = np.where(step_all_filtered <= T0)[0]
-    infer_time_idx = np.where(step_all_filtered == T0 + 1)[0]
-    if infer_time_idx.size == 0:
+    train_idx = np.where(step_all_filtered <= T0)[0]
+    test_idx  = np.where(step_all_filtered == T0 + 1)[0]
+    if test_idx.size == 0:
         continue
 
-    # 7.2. Budowa subgrafu trenowanego (T0-only)
+    T0_list.append(T0)
+
     mask_train_nodes = np.zeros(n_nodes, dtype=bool)
-    mask_train_nodes[train_time_idx] = True
+    mask_train_nodes[train_idx] = True
     adj_train = adjacency_all[mask_train_nodes][:, mask_train_nodes]
-    feats_train = filtered_feats[train_time_idx, :]
+    feats_train = filtered_feats[train_idx, :]
 
-    # 7.3. Mapowanie „starych” indeksów na nowe lokalne dla subgrafu trenowanego
-    new_id_map = {old: new for new, old in enumerate(train_time_idx)}
-    labels_train_dict = {new_id_map[idx]: int(y_all_filtered[idx]) for idx in train_time_idx}
+    new_id_map = {old: new for new, old in enumerate(train_idx)}
+    labels_train_dict = {new_id_map[idx]: int(y_all_filtered[idx]) for idx in train_idx}
 
-    # 7.4. Trening GNNClassifier na subgrafie T0-only
     gnn = GNNClassifier(
         dims=[64, 32, 2],
         layer_types='Conv',
@@ -196,45 +110,73 @@ for T0 in range(1, max_step):
         patience=10,
         verbose=False
     )
-    gnn.fit(adj_train, feats_train, labels_train_dict,
-            n_epochs=100, validation=0.1, random_state=42)
+    gnn.fit(adj_train, feats_train, labels_train_dict, n_epochs=100, validation=0.1, random_state=42)
 
-    # 7.5. Budowa subgrafu inferencyjnego (T0 + T0+1)
-    combined_idx = np.concatenate([train_time_idx, infer_time_idx])
-    n_train = train_time_idx.size
-    n_infer = infer_time_idx.size
-    n_comb = n_train + n_infer
+    combined_idx = np.concatenate([train_idx, test_idx])
+    n_train = train_idx.size
+    n_test = test_idx.size
     feats_infer = filtered_feats[combined_idx, :]
 
-    # 7.5.1. Wyciągnięcie pełnej macierzy dla combined_idx i zasłonięcie krawędzi między „nowymi” węzłami
     adj_full = adjacency_all[combined_idx][:, combined_idx].tolil()
-    for i_rel in range(n_train, n_comb):
-        for j_rel in range(n_train, n_comb):
+    for i_rel in range(n_train, n_train + n_test):
+        for j_rel in range(n_train, n_train + n_test):
             adj_full[i_rel, j_rel] = 0.0
     adj_infer = adj_full.tocsr()
 
-    # 7.6. Słownik etykiet dla inferencji: tylko dla węzłów treningowych
-    labels_infer_dict = {new_id_map[idx]: int(y_all_filtered[idx]) for idx in train_time_idx}
-
-    # 7.7. Forward pass (n_epochs=0) – model ustawia predykcje w gnn.labels_ dla wszystkich węzłów subgrafu inferencyjnego
+    labels_infer_dict = {new_id_map[idx]: int(y_all_filtered[idx]) for idx in train_idx}
     gnn.fit(adj_infer, feats_infer, labels_infer_dict, n_epochs=0, validation=0.0, random_state=42)
 
     all_pred = gnn.labels_
-    pred_new = all_pred[n_train:n_train + n_infer]
-    true_new = y_all_filtered[infer_time_idx]
-    acc = (pred_new == true_new).sum() / n_infer
+    pred_new = all_pred[n_train:n_train + n_test]
+    true_new = y_all_filtered[test_idx]
 
-    steps.append(T0 + 1)
-    accuracies.append(acc)
+    prec = precision_score(true_new, pred_new, zero_division=0)
+    rec  = recall_score(true_new, pred_new, zero_division=0)
+    f1   = f1_score(true_new, pred_new, zero_division=0)
+    bacc = balanced_accuracy_score(true_new, pred_new)
 
-# =============================================================================
-# 8. Rysowanie wykresu „Accuracy vs Step”
-#    ----------------------------------------------------------------------------
-plt.figure(figsize=(8, 5))
-plt.plot(steps, accuracies, marker='o')
-plt.xlabel('Step (T0 + 1)')
-plt.ylabel('Inference Accuracy')
-plt.title('Accuracy vs Step (Temporal Split)')
+    precisions_all.append(prec)
+    recalls_all.append(rec)
+    f1s_all.append(f1)
+    baccs_all.append(bacc)
+
+    metrics_summary.append({'T0': T0, 'precision': prec, 'recall': rec, 'f1': f1, 'bacc': bacc})
+    f1_scores_per_T0[T0] = f1
+
+plt.figure(figsize=(10, 6))
+plt.plot(T0_list, precisions_all, label='Precision', marker='o')
+plt.plot(T0_list, recalls_all, label='Recall', marker='s')
+plt.plot(T0_list, f1s_all, label='F1-score', marker='^')
+plt.plot(T0_list, baccs_all, label='Balanced Acc', marker='x')
+plt.xlabel("T0")
+plt.ylabel("Wartość metryki")
+plt.title("Metryki dla T0 (test na T0+1)")
+plt.legend()
 plt.grid(True)
 plt.tight_layout()
+plt.savefig("metryki_wykres_zbiorczy_t0plus1.png")
+plt.show()
+
+
+pd.DataFrame(metrics_summary).to_csv("metryki_t0plus1.csv", index=False)
+
+
+f1_vals = list(f1_scores_per_T0.values())
+kruskal_stat, kruskal_p = kruskal(*[[v] for v in f1_vals])
+with open("kruskal_test_t0plus1.txt", "w") as f:
+    f.write(f"Kruskal-Wallis stat={kruskal_stat:.4f}, p-value={kruskal_p:.4e}\n")
+
+
+ranking_df = pd.DataFrame({
+    'T0': list(f1_scores_per_T0.keys()),
+    'F1-score': list(f1_scores_per_T0.values())
+}).sort_values(by='F1-score', ascending=False)
+ranking_df.to_csv("f1_ranking_t0plus1.csv", index=False)
+
+plt.figure(figsize=(10,6))
+sns.barplot(x='T0', y='F1-score', data=ranking_df, palette="Blues_d")
+plt.title("Ranking T0 według F1-score (test na T0+1)")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig("f1_ranking_barplot_t0plus1.png")
 plt.show()
